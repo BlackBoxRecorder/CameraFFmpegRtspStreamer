@@ -6,36 +6,55 @@ namespace CameraFFmpegRtspStreamer
 {
     static class Program
     {
-        static ConcurrentQueue<byte[]> queue = new ConcurrentQueue<byte[]>();
+        static bool isRunning = true;
 
-        static CancellationTokenSource cts = new CancellationTokenSource();
-        static CancellationToken token = cts.Token;
+        static readonly string rtspServer = "rtsp://localhost:8554/camera";
+        static readonly VideoCapture cap = new();
 
-        static void Main(string[] args)
+        static async Task Main(string[] args)
         {
             // ffmpeg 命令行，使用 -i - 表示从标准输入读取
             string ffmpegCommand =
-                "-s 640x480 -r 30 -i - -c:v libx264 -preset veryfast -tune zerolatency -f rtsp rtsp://localhost:8554/camera";
+                $"-s 640x480 -r 30 -i - -c:v libx264 -preset veryfast -tune zerolatency -f rtsp {rtspServer}";
 
-            VideoCapture cap = new VideoCapture();
+            Console.WriteLine("正在打开相机，请等待...");
+
             if (!cap.Open(0))
             {
                 Console.WriteLine("相机未打开");
                 return;
             }
-            Console.WriteLine($"FPS:{cap.Fps}");
 
-            Task.Run(() =>
+            Console.WriteLine($"相机已打开，FPS:{cap.Fps}");
+
+            // 启动 ffmpeg 进程
+            using Process process = new();
+            process.StartInfo.FileName = "ffmpeg";
+            process.StartInfo.Arguments = ffmpegCommand;
+            process.StartInfo.UseShellExecute = false;
+            process.StartInfo.RedirectStandardInput = true;
+            process.StartInfo.RedirectStandardOutput = true;
+            process.StartInfo.RedirectStandardError = true;
+
+            process.Start();
+
+            var task = Task.Run(async () =>
             {
-                while (true)
+                // 获取标准输入流，用于写入图片数据
+                using StreamWriter stdin = process.StandardInput;
+                while (isRunning)
                 {
+                    await Task.Delay(1);
+
                     var mat = new Mat();
                     bool suc = cap.Read(mat);
+
                     if (!suc)
                     {
                         Console.WriteLine("视频结束");
                         break;
                     }
+
                     var point = new Point(20, 20);
                     Cv2.PutText(
                         mat,
@@ -47,54 +66,35 @@ namespace CameraFFmpegRtspStreamer
                     );
 
                     var imgBytes = mat.ToBytes();
-                    queue.Enqueue(imgBytes);
-                    Thread.Sleep(5);
+
+                    try
+                    { // 将图片数据写入标准输入
+                        await stdin.BaseStream.WriteAsync(imgBytes);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine(ex);
+                    }
                 }
             });
 
-            // 启动 ffmpeg 进程
-            using (Process process = new Process())
+            Console.WriteLine($"使用 ffplay.exe 播放RTSP流：ffplay.exe {rtspServer}");
+            Console.WriteLine("按 Q 退出");
+
+            var key = Console.ReadKey().Key;
+            while (key != ConsoleKey.Q)
             {
-                process.StartInfo.FileName = "ffmpeg";
-                process.StartInfo.Arguments = ffmpegCommand;
-                process.StartInfo.UseShellExecute = false;
-                process.StartInfo.RedirectStandardInput = true;
-                process.StartInfo.RedirectStandardOutput = true;
-                process.StartInfo.RedirectStandardError = true;
-
-                process.Start();
-
-                var sw = new Stopwatch();
-                // 获取标准输入流，用于写入图片数据
-                using (StreamWriter stdin = process.StandardInput)
-                {
-                    while (!token.IsCancellationRequested)
-                    {
-                        Thread.Sleep(1);
-
-                        if (queue.TryDequeue(out var imgBytes))
-                        {
-                            // 将图片数据写入标准输入
-                            Task.Run(() =>
-                            {
-                                stdin.BaseStream.Write(imgBytes, 0, imgBytes.Length);
-                            });
-                            Thread.Sleep(1);
-                        }
-                    }
-                }
-
-                // 等待进程退出
-                process.WaitForExit();
-
-                // 读取标准输出和错误输出
-                string output = process.StandardOutput.ReadToEnd();
-                string error = process.StandardError.ReadToEnd();
-
-                // 输出信息
-                Console.WriteLine(output);
-                Console.WriteLine(error);
+                key = Console.ReadKey().Key;
             }
+
+            isRunning = false;
+            await task;
+            Console.WriteLine("Task 退出，程序结束");
+
+            cap.Release();
+            cap.Dispose();
+
+            process.Kill();
         }
     }
 }
